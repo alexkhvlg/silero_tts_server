@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.pt
+*.wav
+*.mp3
+*.ogg
+.env
+logs/
+*.log
