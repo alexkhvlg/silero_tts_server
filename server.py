@@ -233,6 +233,18 @@ class SpeechRequest(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _detect_language(text: str) -> str:
+    """Detect if text is Russian or English.
+
+    Uses simple heuristic: checks for Cyrillic characters.
+    If any Cyrillic chars found → Russian, otherwise → English.
+    """
+    for char in text:
+        if '\u0400' <= char <= '\u04FF' or '\u0500' <= char <= '\u052F':
+            return 'ru'
+    return 'en'
+
+
 def synthesize_to_wav(text: str, language: str, speaker: str) -> bytes:
     """Run Silero TTS and return raw WAV bytes in memory."""
     tts = tts_models[language]
@@ -384,7 +396,34 @@ async def create_speech(request: SpeechRequest):
             detail=f"Unknown voice '{voice_key}'. Available voices: {available}",
         )
 
+    # Auto-detect text language and route to the correct model
+    # This prevents crashes when text language doesn't match voice language
+    detected_lang = _detect_language(request.input)
     language, speaker = VOICE_MAP[voice_key]
+
+    if detected_lang != language:
+        logger.warning(
+            "Text language (%s) doesn't match voice language (%s). "
+            "Switching to %s voice for better quality.",
+            detected_lang, language, detected_lang,
+        )
+        # Find a voice in the detected language
+        fallback_voice = None
+        for vname, (vlang, vspeaker) in VOICE_MAP.items():
+            if vlang == detected_lang:
+                fallback_voice = (detected_lang, vspeaker)
+                break
+        if fallback_voice:
+            language, speaker = fallback_voice
+            logger.info(
+                "Rerouted: lang=%s speaker=%s (was lang=%s)",
+                detected_lang, speaker, voice_key,
+            )
+        else:
+            logger.warning(
+                "No %s voice available, falling back to %s model",
+                detected_lang, language,
+            )
 
     # Validate text length
     if len(request.input) > 5000:
