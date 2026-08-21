@@ -12,6 +12,7 @@ import io
 import logging
 import logging.handlers
 import os
+import re
 import sys
 import wave
 import warnings
@@ -83,6 +84,10 @@ tts_models: dict = {}  # language -> SileroTTS instance
 # Known speakers per model (populated after loading)
 SPEAKERS: dict = {}  # language -> list[str]
 
+# Russian text normalizer (ru-normalizr, mode=tts) — numbers, dates,
+# abbreviations, units, latin->cyrillic. User .dic overrides in dictionaries/.
+ru_normalizer = None
+
 # Mapping: OpenAI voice name -> (language, speaker)
 # e.g. "ru_xenia" -> ("ru", "xenia"), "en_2" -> ("en", "en_2")
 VOICE_MAP: dict = {}  # voice_name -> (language, speaker)
@@ -99,6 +104,21 @@ def _check_model_file(cfg: dict) -> str:
         size_mb = os.path.getsize(path) / (1024 * 1024)
         return f"  Model file exists ({size_mb:.1f} MB)"
     return "  Model file not found — will download on first load (~30-100 MB)"
+
+
+def _load_ru_normalizer() -> None:
+    """Initialize the ru-normalizr instance (mode=tts). Falls back to None."""
+    global ru_normalizer
+    try:
+        from pathlib import Path
+        from ru_normalizr import Normalizer, NormalizeOptions
+        dicts_dir = Path(os.path.dirname(os.path.abspath(__file__))) / "dictionaries"
+        ru_normalizer = Normalizer(NormalizeOptions.tts(dictionaries_path=dicts_dir))
+        logger.info("ru-normalizr loaded (mode=tts), user dictionaries: %s",
+                    dicts_dir if dicts_dir.exists() else "(none)")
+    except Exception as exc:
+        logger.error("Failed to load ru-normalizr — normalization disabled: %s", exc)
+        ru_normalizer = None
 
 
 def load_models(device: str = "cpu", sample_rate: int = 48000) -> None:
@@ -167,6 +187,7 @@ async def lifespan(app: fastapi.FastAPI):
     """Startup / shutdown lifecycle."""
     device = app.state.device
     sample_rate = app.state.sample_rate
+    _load_ru_normalizer()
     try:
         load_models(device=device, sample_rate=sample_rate)
     except Exception as exc:
@@ -233,6 +254,41 @@ class SpeechRequest(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+def normalize_line(tts, line: str, language: str) -> str:
+    """Normalize a single line before feeding it to the model.
+
+    For Russian text the ru-normalizr pipeline (mode=tts) handles digits,
+    dates, time, abbreviations (ГИБДД -> «ги бэ дэ дэ»), units and
+    latin->cyrillic, with user .dic overrides from dictionaries/.
+    Fallback (if ru-normalizr unavailable): library preprocess_text
+    (spell_digits) + per-word transliteration of latin runs.
+    """
+    if language == "ru" and ru_normalizer is not None:
+        try:
+            normalized = ru_normalizer.normalize(line)
+            if normalized and normalized.strip():
+                return normalized
+            logger.warning("ru-normalizr returned empty, falling back to raw line")
+        except Exception as exc:
+            logger.warning("ru-normalizr failed, falling back: %s", exc)
+
+    # Fallback path (pre-ru-normalizr logic)
+    try:
+        preprocessed = tts.preprocess_text(line)
+        if preprocessed:
+            line = " ".join(preprocessed)
+    except Exception as exc:
+        logger.warning("preprocess_text failed, using raw line: %s", exc)
+
+    if language == "ru":
+        try:
+            from silero_tts.transliterate import reverse_transliterate
+            line = re.sub(r"[A-Za-z]+", lambda m: reverse_transliterate(m.group(0), "ru"), line)
+        except Exception as exc:
+            logger.warning("latin transliteration failed: %s", exc)
+    return line
+
+
 def _detect_language(text: str) -> str:
     """Detect if text is Russian or English.
 
@@ -258,6 +314,7 @@ def synthesize_to_wav(text: str, language: str, speaker: str) -> bytes:
 
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     for line in lines:
+        line = normalize_line(tts, line, language)
         try:
             audio = tts.tts_model.apply_tts(
                 text=line,

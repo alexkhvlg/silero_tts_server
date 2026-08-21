@@ -4,3 +4,4 @@ pydantic>=2.0
 silero-tts>=0.0.5
 torch>=2.0.0
 pydub>=0.25.1
+ru-normalizr>=0.3.0
