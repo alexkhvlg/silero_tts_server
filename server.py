@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import wave
+from pathlib import Path
 import warnings
 from contextlib import asynccontextmanager
 from typing import Literal
@@ -87,6 +88,7 @@ SPEAKERS: dict = {}  # language -> list[str]
 # Russian text normalizer (ru-normalizr, mode=tts) — numbers, dates,
 # abbreviations, units, latin->cyrillic. User .dic overrides in dictionaries/.
 ru_normalizer = None
+user_dict_patterns: list = []  # compiled (pattern, replacement) from user_dictionary.dic
 
 # Mapping: OpenAI voice name -> (language, speaker)
 # e.g. "ru_xenia" -> ("ru", "xenia"), "en_2" -> ("en", "en_2")
@@ -107,12 +109,39 @@ def _check_model_file(cfg: dict) -> str:
 
 
 def _load_ru_normalizer() -> None:
-    """Initialize the ru-normalizr instance (mode=tts). Falls back to None."""
-    global ru_normalizer
+    """Initialize the ru-normalizr instance (mode=tts) and the user dictionary.
+
+    NOTE: in ru-normalizr 0.3.0 the built-in pipeline runs latinization
+    BEFORE the dictionary stage, so user .dic rules for Latin tokens
+    (github, venv, git, ...) never match. We therefore load the user
+    dictionary ourselves and apply it as a pre-pass in normalize_line().
+    """
+    global ru_normalizer, user_dict_patterns
+    dicts_dir = Path(os.path.dirname(os.path.abspath(__file__))) / "dictionaries"
+
+    # User dictionary pre-pass (applied BEFORE ru-normalizr, so Latin
+    # tokens are still intact and rules always match).
+    user_dict_patterns = []
+    user_dic = dicts_dir / "user_dictionary.dic"
+    if user_dic.exists():
+        mapping: dict[str, str] = {}
+        for line in user_dic.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if key and not any(c in r"*\[](){}^$.|+?" for c in key):
+                mapping[key.lower()] = value
+        # Longest keys first so "github" wins over a shorter overlapping key.
+        for key in sorted(mapping, key=len, reverse=True):
+            user_dict_patterns.append(
+                (re.compile(rf"(?<!\w){re.escape(key)}(?!\w)", re.IGNORECASE), mapping[key])
+            )
+        logger.info("User dictionary loaded: %d rules from %s", len(user_dict_patterns), user_dic.name)
+
     try:
-        from pathlib import Path
         from ru_normalizr import Normalizer, NormalizeOptions
-        dicts_dir = Path(os.path.dirname(os.path.abspath(__file__))) / "dictionaries"
         ru_normalizer = Normalizer(NormalizeOptions.tts(dictionaries_path=dicts_dir))
         logger.info("ru-normalizr loaded (mode=tts), user dictionaries: %s",
                     dicts_dir if dicts_dir.exists() else "(none)")
@@ -263,6 +292,13 @@ def normalize_line(tts, line: str, language: str) -> str:
     Fallback (if ru-normalizr unavailable): library preprocess_text
     (spell_digits) + per-word transliteration of latin runs.
     """
+    if language == "ru":
+        # User dictionary pre-pass: replace known terms/brands with their
+        # exact pronunciation BEFORE any normalization (Latin tokens intact).
+        if user_dict_patterns:
+            for pattern, replacement in user_dict_patterns:
+                line = pattern.sub(replacement, line)
+
     if language == "ru" and ru_normalizer is not None:
         try:
             normalized = ru_normalizer.normalize(line)
